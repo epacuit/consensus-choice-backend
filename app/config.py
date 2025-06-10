@@ -12,7 +12,11 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
     
     # CORS Settings (for frontend)
-    BACKEND_CORS_ORIGINS: list = ["http://localhost:3000", "http://localhost:5173"]
+    BACKEND_CORS_ORIGINS: list = [
+        "http://localhost:3000", 
+        "http://localhost:5173",
+        "https://consensus-choice.pacuit.org", 
+        "https://consensus-choice-voting.netlify.app/"]
     
     model_config = ConfigDict(env_file=".env")
 
