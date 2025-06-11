@@ -12,11 +12,13 @@ from ..models.results import (
     CandidateRecord, WinnerType
 )
 from .poll_service import PollService
+from .voting_calculation_service import VotingCalculationService
 
 
 class ResultsService:
     def __init__(self):
         self.poll_service = PollService()
+        self.voting_calc_service = VotingCalculationService()
     
     async def calculate_detailed_results(
         self, 
@@ -25,19 +27,15 @@ class ResultsService:
     ) -> DetailedResults:
         """Calculate comprehensive voting results for a poll"""
         
-        # Get poll and ballots
+        # Get poll
         poll = await self.poll_service.get_poll(poll_id)
         if not poll:
             raise ValueError(f"Poll {poll_id} not found")
         
-        # Get all ballots
-        query = {"poll_id": poll_id}
-        if not include_test:
-            query["is_test"] = {"$ne": True}
+        # Get ballot summary to check if we have any votes
+        ballot_summary = await self.voting_calc_service.get_ballot_summary(poll_id, include_test)
         
-        ballot_docs = await db.database.ballots.find(query).to_list(length=None)
-        
-        if not ballot_docs:
+        if ballot_summary["total_votes"] == 0:
             # Return empty results
             candidate_names = {opt.id: opt.name for opt in poll.options}
             candidate_names_list = [opt.name for opt in poll.options]
@@ -85,12 +83,30 @@ class ResultsService:
                 head_to_head_matrices=[]
             )
         
-        # Convert to ProfileWithTies
-        profile = self._create_profile_from_ballots(poll, ballot_docs)
+        # Map option IDs to simple identifiers for pref_voting
+        option_id_to_candidate = {opt.id: f"C{i}" for i, opt in enumerate(poll.options)}
+        candidates = list(option_id_to_candidate.values())
+        
+        # Store mapping for later use
+        self._candidate_to_option_id = {v: k for k, v in option_id_to_candidate.items()}
+        
+        # Create ProfileWithTies using VotingCalculationService
+
+        option_id_to_candidate = {}
+        for i, option in enumerate(poll.options):
+            option_id_to_candidate[str(option.id)] = f"C{i}"  # or use option.text if you prefer
+
+        # Then call with the mapping
+        profile = await self.voting_calc_service.create_profile_with_ties(
+            poll_id, 
+            candidates, 
+            option_id_to_candidate,
+            include_test
+        )
+
         profile.use_extended_strict_preference()
         
         # Get candidate names
-        candidates = list(profile.candidates)
         candidate_names = {opt.id: opt.name for opt in poll.options}
         
         # Calculate Condorcet winners
@@ -109,18 +125,24 @@ class ResultsService:
             candidate_names
         )
         
+        # Get ballot types with count awareness
+        ballot_types = await self._get_ballot_types_with_counts(poll_id, candidate_names, include_test)
+        
+        # Get ballot statistics
+        stats = await self._get_ballot_statistics(poll_id, candidate_names, include_test)
+        
         # Calculate all results
         results = DetailedResults(
             poll_id=poll_id,
             calculated_at=datetime.utcnow(),
-            total_voters=profile.num_voters,
-            total_ballots=len(ballot_docs),
+            total_voters=ballot_summary["total_votes"],
+            total_ballots=ballot_summary["total_ballot_records"],
             num_candidates=len(candidates),
             candidates=[candidate_names.get(self._candidate_to_option_id.get(c, c), c) for c in candidates],
-            ballot_types=self._get_ballot_types(profile, candidate_names),
-            num_bullet_votes=self._count_bullet_votes(profile),
-            num_complete_rankings=self._count_complete_rankings(profile),
-            num_linear_orders=self._count_linear_orders(profile),
+            ballot_types=ballot_types,
+            num_bullet_votes=stats["bullet_votes"],
+            num_complete_rankings=stats["complete_rankings"],
+            num_linear_orders=stats["linear_orders"],
             pairwise_matrix=self._get_pairwise_matrix(profile, candidate_names),
             pairwise_support_matrix=self._get_pairwise_support_matrix(profile, candidate_names),
             pairwise_comparisons=self._get_pairwise_comparisons(profile, candidate_names),
@@ -132,33 +154,40 @@ class ResultsService:
             is_tie=is_tie,
             candidate_records=candidate_records,
             voting_results=self._calculate_voting_results(profile, candidate_names),
-            head_to_head_matrices=self._calculate_head_to_head_matrices(profile, candidate_names)
+            head_to_head_matrices=await self._calculate_head_to_head_matrices_with_counts(poll_id, candidate_names, include_test)
         )
         
         return results
     
-    def _create_profile_from_ballots(
+    async def _get_ballot_types_with_counts(
         self, 
-        poll, 
-        ballot_docs: List[dict]
-    ) -> ProfileWithTies:
-        """Convert poll and ballots to ProfileWithTies format"""
+        poll_id: str,
+        candidate_names: Dict[str, str],
+        include_test: bool = False
+    ) -> List[BallotType]:
+        """Extract and count unique ballot types with count awareness"""
         
-        # Map option IDs to simple identifiers for pref_voting
-        option_id_to_candidate = {opt.id: f"C{i}" for i, opt in enumerate(poll.options)}
+        # Get all ballots
+        query = {"poll_id": poll_id}
+        if not include_test:
+            query["is_test"] = {"$ne": True}
         
-        # Group identical ballots
-        ballot_counter = Counter()
+        ballot_docs = await db.database.ballots.find(query).to_list(length=None)
+        
+        # Group identical rankings and sum their counts
+        ballot_counter = defaultdict(int)
         
         for ballot_doc in ballot_docs:
-            # Convert rankings to preference format with ties
+            count = ballot_doc.get("count", 1)  # Default to 1 for old ballots
+            
+            # Convert rankings to a hashable format
             rankings_by_rank = defaultdict(list)
             
             for ranking in ballot_doc["rankings"]:
                 option_id = ranking["option_id"]
                 rank = ranking["rank"]
-                candidate = option_id_to_candidate[option_id]
-                rankings_by_rank[rank].append(candidate)
+                name = candidate_names.get(option_id, option_id)
+                rankings_by_rank[rank].append(name)
             
             # Create ranking tuple of tuples (for ties)
             sorted_ranks = sorted(rankings_by_rank.keys())
@@ -167,27 +196,162 @@ class ResultsService:
                 for rank in sorted_ranks
             )
             
-            ballot_counter[ranking_tuple] += 1
+            ballot_counter[ranking_tuple] += count
         
-        # Create ProfileWithTies with unique rankings and their counts
-        rankings = []
-        counts = []
+        # Convert to BallotType objects
+        ballot_types = []
+        total_votes = sum(ballot_counter.values())
         
         for ranking_tuple, count in ballot_counter.items():
-            # Convert tuple format to dictionary format for ProfileWithTies
-            ranking_dict = {}
-            for rank_idx, candidates_at_rank in enumerate(ranking_tuple):
-                for candidate in candidates_at_rank:
-                    ranking_dict[candidate] = rank_idx + 1
-            rankings.append(ranking_dict)
-            counts.append(count)
+            # Convert tuple format to list format
+            ranking_list = [list(tier) for tier in ranking_tuple]
+            
+            ballot_types.append(BallotType(
+                ranking=ranking_list,
+                count=count,
+                percentage=(count / total_votes * 100) if total_votes > 0 else 0
+            ))
         
-        candidates = list(option_id_to_candidate.values())
+        # Sort by count descending
+        ballot_types.sort(key=lambda x: x.count, reverse=True)
+        return ballot_types
+    
+    async def _get_ballot_statistics(
+        self,
+        poll_id: str,
+        candidate_names: Dict[str, str],
+        include_test: bool = False
+    ) -> Dict[str, int]:
+        """Calculate ballot statistics with count awareness"""
         
-        # Store mapping for later use
-        self._candidate_to_option_id = {v: k for k, v in option_id_to_candidate.items()}
+        query = {"poll_id": poll_id}
+        if not include_test:
+            query["is_test"] = {"$ne": True}
         
-        return ProfileWithTies(rankings, rcounts=counts, candidates=candidates)
+        ballot_docs = await db.database.ballots.find(query).to_list(length=None)
+        
+        bullet_votes = 0
+        complete_rankings = 0
+        linear_orders = 0
+        total_candidates = len(candidate_names)
+        
+        for ballot_doc in ballot_docs:
+            count = ballot_doc.get("count", 1)
+            rankings = ballot_doc["rankings"]
+            
+            # Check if bullet vote (only one candidate ranked)
+            if len(rankings) == 1:
+                bullet_votes += count
+            
+            # Check if complete ranking (all candidates ranked)
+            if len(rankings) == total_candidates:
+                complete_rankings += count
+            
+            # Check if linear order (no ties)
+            ranks_used = [r["rank"] for r in rankings]
+            if len(ranks_used) == len(set(ranks_used)):  # All ranks are unique
+                linear_orders += count
+        
+        return {
+            "bullet_votes": bullet_votes,
+            "complete_rankings": complete_rankings,
+            "linear_orders": linear_orders
+        }
+    
+    async def _calculate_head_to_head_matrices_with_counts(
+        self, 
+        poll_id: str,
+        candidate_names: Dict[str, str],
+        include_test: bool = False
+    ) -> List[HeadToHeadMatrix]:
+        """Calculate which ballot types have A ranked above B with count awareness"""
+        
+        matrices = []
+        
+        # Get all ballots
+        query = {"poll_id": poll_id}
+        if not include_test:
+            query["is_test"] = {"$ne": True}
+        
+        ballot_docs = await db.database.ballots.find(query).to_list(length=None)
+        
+        # Group ballots by ranking pattern
+        ranking_patterns = defaultdict(int)
+        ranking_examples = {}
+        
+        for ballot_doc in ballot_docs:
+            count = ballot_doc.get("count", 1)
+            
+            # Create hashable representation
+            rankings_by_rank = defaultdict(list)
+            for ranking in ballot_doc["rankings"]:
+                option_id = ranking["option_id"]
+                rank = ranking["rank"]
+                rankings_by_rank[rank].append(option_id)
+            
+            sorted_ranks = sorted(rankings_by_rank.keys())
+            ranking_tuple = tuple(
+                tuple(sorted(rankings_by_rank[rank])) 
+                for rank in sorted_ranks
+            )
+            
+            ranking_patterns[ranking_tuple] += count
+            if ranking_tuple not in ranking_examples:
+                ranking_examples[ranking_tuple] = rankings_by_rank
+        
+        # Calculate head-to-head for all pairs
+        all_option_ids = list(candidate_names.keys())
+        
+        for opt_id1 in all_option_ids:
+            for opt_id2 in all_option_ids:
+                if opt_id1 == opt_id2:
+                    continue
+                
+                name1 = candidate_names[opt_id1]
+                name2 = candidate_names[opt_id2]
+                
+                # Find all ballot types where opt_id1 beats opt_id2
+                ballot_types = []
+                total_count = 0
+                
+                for ranking_tuple, count in ranking_patterns.items():
+                    rankings_by_rank = ranking_examples[ranking_tuple]
+                    
+                    # Find ranks of opt_id1 and opt_id2
+                    rank1 = None
+                    rank2 = None
+                    
+                    for rank, options in rankings_by_rank.items():
+                        if opt_id1 in options:
+                            rank1 = rank
+                        if opt_id2 in options:
+                            rank2 = rank
+                    
+                    # Check if opt_id1 beats opt_id2 (ranked better)
+                    if rank1 is not None and rank2 is not None and rank1 < rank2:
+                        # Convert to named ranking list
+                        named_ranking_list = []
+                        for rank in sorted(rankings_by_rank.keys()):
+                            tier = [candidate_names.get(opt_id, opt_id) for opt_id in rankings_by_rank[rank]]
+                            named_ranking_list.append(tier)
+                        
+                        total_votes = sum(ranking_patterns.values())
+                        ballot_types.append(BallotType(
+                            ranking=named_ranking_list,
+                            count=count,
+                            percentage=(count / total_votes * 100) if total_votes > 0 else 0
+                        ))
+                        total_count += count
+                
+                if ballot_types:  # Only add if there are ballot types where opt_id1 beats opt_id2
+                    matrices.append(HeadToHeadMatrix(
+                        candidate_a=name1,
+                        candidate_b=name2,
+                        ballot_types=ballot_types,
+                        total_count=total_count
+                    ))
+        
+        return matrices
     
     def _calculate_candidate_records(
         self,
@@ -316,70 +480,6 @@ class ResultsService:
                     return WinnerType.COPELAND, tied_candidates[0], [], False
         
         return WinnerType.NONE, None, [], False
-    
-    def _get_ballot_types(
-        self, 
-        profile: ProfileWithTies,
-        candidate_names: Dict[str, str]
-    ) -> List[BallotType]:
-        """Extract and count unique ballot types"""
-        
-        ballot_types = []
-        total_voters = profile.num_voters
-        
-        # Use rankings_counts property
-        rankings, counts = profile.rankings_counts
-        
-        # Access rankings and counts together
-        for ranking, count in zip(rankings, counts):
-            ranking_list = ranking.to_indiff_list()
-            
-            # Convert candidate IDs in ranking to names
-            named_ranking_list = []
-            for tier in ranking_list:
-                named_tier = []
-                for candidate in tier:
-                    option_id = self._candidate_to_option_id.get(candidate, candidate)
-                    name = candidate_names.get(option_id, candidate)
-                    named_tier.append(name)
-                named_ranking_list.append(named_tier)
-            
-            ballot_types.append(BallotType(
-                ranking=named_ranking_list,
-                count=count,
-                percentage=(count / total_voters) * 100
-            ))
-        
-        # Sort by count descending
-        ballot_types.sort(key=lambda x: x.count, reverse=True)
-        return ballot_types
-    
-    def _count_bullet_votes(self, profile: ProfileWithTies) -> int:
-        """Count ballots that rank only one candidate"""
-        bullet_count = 0
-        rankings, counts = profile.rankings_counts
-        for ranking, count in zip(rankings, counts):
-            if ranking.is_bullet_vote():
-                bullet_count += count
-        return bullet_count
-    
-    def _count_complete_rankings(self, profile: ProfileWithTies) -> int:
-        """Count ballots that rank all candidates"""
-        complete_count = 0
-        rankings, counts = profile.rankings_counts
-        for ranking, count in zip(rankings, counts):
-            if len(ranking.cands) == len(profile.candidates):
-                complete_count += count
-        return complete_count
-    
-    def _count_linear_orders(self, profile: ProfileWithTies) -> int:
-        """Count ballots with no ties (strict preferences)"""
-        linear_count = 0
-        rankings, counts = profile.rankings_counts
-        for ranking, count in zip(rankings, counts):
-            if ranking.is_linear(len(profile.candidates)) or ranking.is_truncated_linear(len(profile.candidates)):
-                linear_count += count
-        return linear_count
     
     def _get_pairwise_matrix(
         self, 
@@ -576,62 +676,3 @@ class ResultsService:
         ))
         
         return results
-    
-    def _calculate_head_to_head_matrices(
-        self, 
-        profile: ProfileWithTies,
-        candidate_names: Dict[str, str]
-    ) -> List[HeadToHeadMatrix]:
-        """Calculate which ballot types have A ranked above B for all pairs"""
-        matrices = []
-        
-        candidates = list(profile.candidates)
-        rankings, counts = profile.rankings_counts
-        
-        for c1 in candidates:
-            for c2 in candidates:
-                if c1 == c2:
-                    continue
-                
-                # Find all ballot types where c1 beats c2
-                ballot_types = []
-                total_count = 0
-                
-                for ranking, count in zip(rankings, counts):
-                    # Use pref_voting's extended_strict_pref to check if c1 beats c2
-                    if ranking.extended_strict_pref(c1, c2):
-                        # Convert ranking to readable format
-                        ranking_list = ranking.to_indiff_list()
-                        
-                        # Convert candidate IDs to names
-                        named_ranking_list = []
-                        for tier in ranking_list:
-                            tier_names = []
-                            for candidate in tier:
-                                option_id = self._candidate_to_option_id.get(candidate, candidate)
-                                name = candidate_names.get(option_id, candidate)
-                                tier_names.append(name)
-                            named_ranking_list.append(tier_names)
-                        
-                        ballot_types.append(BallotType(
-                            ranking=named_ranking_list,
-                            count=count,
-                            percentage=(count / profile.num_voters) * 100
-                        ))
-                        total_count += count
-                
-                # Verify total_count matches profile.support
-                assert total_count == profile.support(c1, c2), f"Mismatch in support calculation"
-                
-                if ballot_types:  # Only add if there are ballot types where c1 beats c2
-                    option_id1 = self._candidate_to_option_id.get(c1, c1)
-                    option_id2 = self._candidate_to_option_id.get(c2, c2)
-                    
-                    matrices.append(HeadToHeadMatrix(
-                        candidate_a=candidate_names.get(option_id1, c1),
-                        candidate_b=candidate_names.get(option_id2, c2),
-                        ballot_types=ballot_types,
-                        total_count=total_count
-                    ))
-        
-        return matrices

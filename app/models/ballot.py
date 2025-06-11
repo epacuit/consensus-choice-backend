@@ -7,6 +7,7 @@ class VoterType(str, Enum):
     AUTHENTICATED = "authenticated"  # Private poll with token
     ANONYMOUS = "anonymous"         # Public poll
     TEST = "test"                  # Test votes for demo
+    AGGREGATED = "aggregated"      # Bulk imported/aggregated votes
 
 class RankingEntry(BaseModel):
     """Represents a single ranking entry in a ballot"""
@@ -50,7 +51,7 @@ class BallotSubmit(BaseModel):
         return v
 
 class Ballot(BaseModel):
-    """Stored ballot record"""
+    """Unified ballot record that can represent single or aggregated votes"""
     id: str
     poll_id: str
     voter_type: VoterType
@@ -58,7 +59,10 @@ class Ballot(BaseModel):
     # The actual rankings
     rankings: List[RankingEntry]
     
-    # Voter identification
+    # Number of ballots with this ranking (1 for individual votes)
+    count: int = 1
+    
+    # Voter identification (for individual ballots with count=1)
     voter_email: Optional[str] = None  # For authenticated voters
     voter_token: Optional[str] = None  # For authenticated voters
     browser_fingerprint: Optional[str] = None  # For anonymous voters
@@ -67,6 +71,9 @@ class Ballot(BaseModel):
     submitted_at: datetime
     ip_address: Optional[str] = None
     user_agent: Optional[str] = None
+    
+    # For tracking bulk imports
+    import_batch_id: Optional[str] = None
     
     # For test votes
     is_test: bool = False
@@ -80,7 +87,8 @@ class Ballot(BaseModel):
 class VoteResults(BaseModel):
     """Live voting results"""
     poll_id: str
-    total_ballots: int
+    total_ballots: int  # Sum of all ballot counts (total votes)
+    total_ballot_records: int  # Number of ballot documents in database
     total_test_ballots: int
     
     # Rankings by option_id

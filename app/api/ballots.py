@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from fastapi import APIRouter, HTTPException, status, Request, Query
 from pydantic import BaseModel
 from ..models.ballot import Ballot, BallotSubmit, VoteResults
@@ -19,10 +19,15 @@ class BulkImportRequest(BaseModel):
     # New auth fields
     admin_token: str = None
     password: str = None
+    # Optimization options
+    use_aggregation: bool = True
+    batch_name: Optional[str] = None
 
 class BulkImportResponse(BaseModel):
     imported_count: int
-    failed_count: int
+    failed_count: int = 0
+    unique_patterns: Optional[int] = None
+    batch_id: Optional[str] = None
     message: str
 
 class DeleteBallotsRequest(BaseModel):
@@ -103,17 +108,21 @@ async def bulk_import_ballots(bulk_request: BulkImportRequest, request: Request)
         ip_address = request.client.host if request.client else None
         user_agent = request.headers.get("user-agent")
         
-        # Process ballots
+        # Process ballots with aggregation support
         result = await ballot_service.bulk_import_ballots(
             poll_id=bulk_request.poll_id,
             ballots=bulk_request.ballots,
             ip_address=ip_address,
-            user_agent=user_agent
+            user_agent=user_agent,
+            use_aggregation=bulk_request.use_aggregation,
+            batch_name=bulk_request.batch_name
         )
         
         return BulkImportResponse(
             imported_count=result["imported_count"],
-            failed_count=result["failed_count"],
+            failed_count=result.get("failed_count", 0),
+            unique_patterns=result.get("unique_patterns"),
+            batch_id=result.get("batch_id"),
             message=result["message"]
         )
     
@@ -172,7 +181,7 @@ async def delete_all_ballots(poll_id: str, request: DeleteBallotsRequest):
         
         return {
             "deleted_count": delete_result.deleted_count,
-            "message": f"Deleted {delete_result.deleted_count} ballots",
+            "message": f"Deleted {delete_result.deleted_count} ballot records",
             "poll_updated": update_result.modified_count > 0
         }
     except HTTPException:
@@ -183,3 +192,72 @@ async def delete_all_ballots(poll_id: str, request: DeleteBallotsRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+
+@router.get("/poll/{poll_id}/import-batches")
+async def get_import_batches(
+    poll_id: str,
+    admin_token: Optional[str] = Query(None, description="Admin authentication token")
+):
+    """Get list of import batches for a poll"""
+    # Verify admin authentication
+    poll = await poll_service.get_poll(poll_id)
+    if not poll:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Poll {poll_id} not found"
+        )
+    
+    if not admin_token or poll.admin_token != admin_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Admin authentication required"
+        )
+    
+    # Get import batches from ballot service
+    batches = await ballot_service.get_import_batches(poll_id)
+    
+    return {"batches": batches}
+
+@router.get("/poll/{poll_id}/ballot-stats")
+async def get_ballot_statistics(
+    poll_id: str,
+    admin_token: Optional[str] = Query(None, description="Admin authentication token")
+):
+    """Get statistics about ballot storage efficiency"""
+    # Verify admin authentication
+    poll = await poll_service.get_poll(poll_id)
+    if not poll:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Poll {poll_id} not found"
+        )
+    
+    if not admin_token or poll.admin_token != admin_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Admin authentication required"
+        )
+    
+    # Get ballot statistics from voting calculation service
+    from ..services.voting_calculation_service import VotingCalculationService
+    voting_calc_service = VotingCalculationService()
+    
+    stats = await voting_calc_service.get_ballot_summary(poll_id, include_test=False)
+    
+    # Calculate compression ratio
+    if stats["total_ballot_records"] > 0:
+        compression_ratio = stats["total_votes"] / stats["total_ballot_records"]
+    else:
+        compression_ratio = 0
+    
+    return {
+        "poll_id": poll_id,
+        "total_votes": stats["total_votes"],
+        "total_ballot_records": stats["total_ballot_records"],
+        "compression_ratio": round(compression_ratio, 2),
+        "individual_ballots": stats["individual_ballots"],
+        "aggregated_ballots": stats["aggregated_ballots"],
+        "average_votes_per_record": round(stats["avg_votes_per_record"], 2),
+        "max_votes_in_single_record": stats["max_count"],
+        "storage_efficiency": f"{round((1 - stats['total_ballot_records']/stats['total_votes']) * 100, 1)}%" if stats["total_votes"] > 0 else "0%"
+    }
