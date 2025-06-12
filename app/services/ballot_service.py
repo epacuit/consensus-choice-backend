@@ -142,6 +142,20 @@ class BallotService:
         if poll.has_closed:
             raise ValueError("Poll has closed")
         
+        # ENHANCED VALIDATION: Check all option IDs before processing
+        valid_option_ids = {opt.id for opt in poll.options}
+        option_names = {opt.id: opt.name for opt in poll.options}
+        
+        for i, ballot in enumerate(ballots):
+            for ranking in ballot.rankings:
+                if ranking.option_id not in valid_option_ids:
+                    # Provide helpful error message with valid options
+                    valid_names = [opt.name for opt in poll.options]
+                    raise ValueError(
+                        f"Ballot {i+1}: Invalid option ID '{ranking.option_id}'. "
+                        f"Valid options are: {', '.join(valid_names)}"
+                    )
+        
         # Generate batch ID
         batch_id = f"{datetime.utcnow().isoformat()}_{batch_name or 'bulk'}"
         
@@ -229,6 +243,48 @@ class BallotService:
                 "batch_id": batch_id,
                 "message": message
             }
+
+    async def delete_all_ballots(
+        self,
+        poll_id: str,
+        exclude_test: bool = True
+    ) -> int:
+        """Delete all ballots for a poll
+        
+        Args:
+            poll_id: The poll ID
+            exclude_test: If True, keep test ballots
+            
+        Returns:
+            Number of deleted ballot records
+        """
+        
+        # Verify poll exists
+        poll = await self.poll_service.get_poll(poll_id)
+        if not poll:
+            raise ValueError(f"Poll {poll_id} not found")
+        
+        # Build deletion query
+        query = {"poll_id": poll_id}
+        if exclude_test:
+            query["is_test"] = {"$ne": True}
+        
+        # Delete ballots
+        result = await self.ballots_collection.delete_many(query)
+        
+        # Reset vote count on the poll
+        if result.deleted_count > 0:
+            await self.polls_collection.update_one(
+                {"_id": ObjectId(poll_id)},
+                {
+                    "$set": {
+                        "vote_count": 0,
+                        "last_vote_at": None
+                    }
+                }
+            )
+        
+        return result.deleted_count
 
     async def get_live_results(self, poll_id: str, include_test: bool = False) -> VoteResults:
         """Calculate live voting results with count-aware processing"""

@@ -176,6 +176,7 @@ class ResultsService:
         
         # Group identical rankings and sum their counts
         ballot_counter = defaultdict(int)
+        ballot_examples = {}  # Store an example of each ranking pattern for display
         
         for ballot_doc in ballot_docs:
             count = ballot_doc.get("count", 1)  # Default to 1 for old ballots
@@ -196,15 +197,24 @@ class ResultsService:
                 for rank in sorted_ranks
             )
             
+            # Accumulate the count for this ranking pattern
             ballot_counter[ranking_tuple] += count
+            
+            # Store an example of this ranking pattern if we haven't seen it before
+            if ranking_tuple not in ballot_examples:
+                ballot_examples[ranking_tuple] = [
+                    list(tier) for tier in ranking_tuple
+                ]
+        
+        # Calculate total votes (not total ballot records!)
+        total_votes = sum(ballot_counter.values())
         
         # Convert to BallotType objects
         ballot_types = []
-        total_votes = sum(ballot_counter.values())
         
         for ranking_tuple, count in ballot_counter.items():
-            # Convert tuple format to list format
-            ranking_list = [list(tier) for tier in ranking_tuple]
+            # Use the stored example for this ranking pattern
+            ranking_list = ballot_examples[ranking_tuple]
             
             ballot_types.append(BallotType(
                 ranking=ranking_list,
@@ -214,6 +224,7 @@ class ResultsService:
         
         # Sort by count descending
         ballot_types.sort(key=lambda x: x.count, reverse=True)
+        
         return ballot_types
     
     async def _get_ballot_statistics(
@@ -236,21 +247,21 @@ class ResultsService:
         total_candidates = len(candidate_names)
         
         for ballot_doc in ballot_docs:
-            count = ballot_doc.get("count", 1)
+            count = ballot_doc.get("count", 1)  # IMPORTANT: Use count!
             rankings = ballot_doc["rankings"]
             
             # Check if bullet vote (only one candidate ranked)
             if len(rankings) == 1:
-                bullet_votes += count
+                bullet_votes += count  # Add count, not 1
             
             # Check if complete ranking (all candidates ranked)
             if len(rankings) == total_candidates:
-                complete_rankings += count
+                complete_rankings += count  # Add count, not 1
             
             # Check if linear order (no ties)
             ranks_used = [r["rank"] for r in rankings]
             if len(ranks_used) == len(set(ranks_used)):  # All ranks are unique
-                linear_orders += count
+                linear_orders += count  # Add count, not 1
         
         return {
             "bullet_votes": bullet_votes,
@@ -295,9 +306,12 @@ class ResultsService:
                 for rank in sorted_ranks
             )
             
-            ranking_patterns[ranking_tuple] += count
+            ranking_patterns[ranking_tuple] += count  # Accumulate count
             if ranking_tuple not in ranking_examples:
                 ranking_examples[ranking_tuple] = rankings_by_rank
+        
+        # Calculate total votes for percentage calculations
+        total_votes = sum(ranking_patterns.values())
         
         # Calculate head-to-head for all pairs
         all_option_ids = list(candidate_names.keys())
@@ -335,7 +349,6 @@ class ResultsService:
                             tier = [candidate_names.get(opt_id, opt_id) for opt_id in rankings_by_rank[rank]]
                             named_ranking_list.append(tier)
                         
-                        total_votes = sum(ranking_patterns.values())
                         ballot_types.append(BallotType(
                             ranking=named_ranking_list,
                             count=count,
@@ -344,6 +357,9 @@ class ResultsService:
                         total_count += count
                 
                 if ballot_types:  # Only add if there are ballot types where opt_id1 beats opt_id2
+                    # Sort ballot types by count for better display
+                    ballot_types.sort(key=lambda x: x.count, reverse=True)
+                    
                     matrices.append(HeadToHeadMatrix(
                         candidate_a=name1,
                         candidate_b=name2,

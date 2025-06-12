@@ -22,6 +22,8 @@ class BulkImportRequest(BaseModel):
     # Optimization options
     use_aggregation: bool = True
     batch_name: Optional[str] = None
+    # ADD THIS: Overwrite existing ballots option
+    overwrite_existing: bool = False
 
 class BulkImportResponse(BaseModel):
     imported_count: int
@@ -108,6 +110,15 @@ async def bulk_import_ballots(bulk_request: BulkImportRequest, request: Request)
         ip_address = request.client.host if request.client else None
         user_agent = request.headers.get("user-agent")
         
+        # UPDATED: Handle overwrite if requested
+        if bulk_request.overwrite_existing:
+            # Delete all existing non-test ballots
+            deleted_count = await ballot_service.delete_all_ballots(
+                poll_id=bulk_request.poll_id,
+                exclude_test=True
+            )
+            print(f"Deleted {deleted_count} existing ballots before import")
+        
         # Process ballots with aggregation support
         result = await ballot_service.bulk_import_ballots(
             poll_id=bulk_request.poll_id,
@@ -117,6 +128,10 @@ async def bulk_import_ballots(bulk_request: BulkImportRequest, request: Request)
             use_aggregation=bulk_request.use_aggregation,
             batch_name=bulk_request.batch_name
         )
+        
+        # Update message if overwrite was used
+        if bulk_request.overwrite_existing:
+            result["message"] = f"Overwrote existing ballots. {result['message']}"
         
         return BulkImportResponse(
             imported_count=result["imported_count"],
@@ -153,13 +168,17 @@ async def get_poll_results(
         )
 
 @router.delete("/poll/{poll_id}/all")
-async def delete_all_ballots(poll_id: str, request: DeleteBallotsRequest):
+async def delete_all_ballots(
+    poll_id: str,
+    admin_token: Optional[str] = Query(None, description="Admin authentication token"),
+    password: Optional[str] = Query(None, description="Admin password")
+):
     """Delete all ballots for a poll - requires admin authentication"""
     try:
-        # Authenticate using new system
+        # Authenticate using query parameters
         auth_data = {
-            "admin_token": request.admin_token,
-            "password": request.password
+            "admin_token": admin_token,
+            "password": password
         }
         
         is_authenticated = await authenticate_admin(poll_id, auth_data)
@@ -170,24 +189,23 @@ async def delete_all_ballots(poll_id: str, request: DeleteBallotsRequest):
                 detail="Invalid authentication credentials"
             )
         
-        # Delete all ballots for this poll
-        delete_result = await db.database.ballots.delete_many({"poll_id": poll_id})
-        
-        # Reset vote count on poll
-        update_result = await db.database.polls.update_one(
-            {"_id": ObjectId(poll_id)},
-            {"$set": {"vote_count": 0, "last_vote_at": None}}
+        # Use the delete_all_ballots service method
+        deleted_count = await ballot_service.delete_all_ballots(
+            poll_id=poll_id,
+            exclude_test=True
         )
         
         return {
-            "deleted_count": delete_result.deleted_count,
-            "message": f"Deleted {delete_result.deleted_count} ballot records",
-            "poll_updated": update_result.modified_count > 0
+            "deleted_count": deleted_count,
+            "message": f"Deleted {deleted_count} ballot records",
+            "poll_updated": True
         }
     except HTTPException:
         raise
     except Exception as e:
         print(f"Error deleting ballots: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
